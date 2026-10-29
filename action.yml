@@ -1,0 +1,137 @@
+name: "Skills Doctor: Agent Skills linter"
+description: "Lint Agent Skills (SKILL.md) in CI: frontmatter, names, trigger language, missing scripts, leaked secrets and overlaps."
+author: "Milad Ahmadi"
+branding:
+  icon: activity
+  color: green
+
+inputs:
+  path:
+    description: >-
+      Skills folders to lint, space- or newline-separated (globs allowed, e.g. plugins/*/skills). A folder may be a
+      single skill (contains SKILL.md) or a folder of skills. Default: every one of skills, .claude/skills and
+      .agents/skills that exists.
+    required: false
+    default: ""
+  strict:
+    description: >-
+      true: warnings and overlaps fail the step, like `skills_doctor.py --strict`. false: only errors fail.
+      Ignored when fail-on is set.
+    required: false
+    default: "true"
+  fail-on:
+    description: >-
+      Lowest severity that fails the step: error, warning (warnings and overlaps too) or never (annotate only).
+      Empty: derived from strict (true = warning, false = error).
+    required: false
+    default: ""
+  overlap:
+    description: "Jaccard threshold for two whole descriptions to count as overlapping."
+    required: false
+    default: "0.20"
+  trigger-overlap:
+    description: "Jaccard threshold for two 'Use when…' clauses to count as overlapping."
+    required: false
+    default: "0.30"
+
+outputs:
+  exit-code:
+    description: "Linter exit code: 0 clean, 1 errors, 2 warnings or overlaps only."
+    value: ${{ steps.lint.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Find Python
+      id: py
+      shell: bash
+      run: |
+        for c in python3 python; do
+          if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
+            echo "python=$(command -v "$c")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        done
+        echo "No Python 3.9+ on PATH; installing one with actions/setup-python."
+
+    - name: Set up Python (only if the runner has none)
+      id: setup
+      if: steps.py.outputs.python == ''
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.x"
+        update-environment: false
+
+    - name: Run skills-doctor
+      id: lint
+      shell: bash
+      env:
+        SD_PYTHON: ${{ steps.py.outputs.python || steps.setup.outputs.python-path }}
+        SD_PATH: ${{ inputs.path }}
+        SD_STRICT: ${{ inputs.strict }}
+        SD_FAIL_ON: ${{ inputs.fail-on }}
+        SD_OVERLAP: ${{ inputs.overlap }}
+        SD_TRIGGER_OVERLAP: ${{ inputs.trigger-overlap }}
+        PYTHONIOENCODING: utf-8
+        PYTHONUTF8: "1"
+      run: |
+        # Inputs arrive only as env vars (no expression interpolation in this script), so they cannot inject shell code.
+        lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+        fail_on="$(lower "$SD_FAIL_ON")"
+        if [[ -z "$fail_on" ]]; then
+          case "$(lower "$SD_STRICT")" in
+            true|yes|on|1) fail_on=warning ;;
+            false|no|off|0) fail_on=error ;;
+            *) echo "::error title=skills-doctor::input strict must be true or false"; exit 1 ;;
+          esac
+        fi
+        case "$fail_on" in
+          error|warning|never) ;;
+          *) echo "::error title=skills-doctor::input fail-on must be error, warning or never"; exit 1 ;;
+        esac
+        for v in "$SD_OVERLAP" "$SD_TRIGGER_OVERLAP"; do
+          if ! [[ "$v" =~ ^(0?\.[0-9]+|0|1|1\.0+)$ ]]; then
+            echo "::error title=skills-doctor::overlap thresholds must be numbers between 0 and 1"; exit 1
+          fi
+        done
+
+        dirs=()
+        if [[ -n "${SD_PATH//[[:space:]]/}" ]]; then
+          missing=0
+          for p in $SD_PATH; do  # split on whitespace, expand globs; no eval
+            if [[ -e "$p" ]]; then
+              dirs+=("$p")
+            else
+              echo "::error title=skills-doctor::path not found: ${p//%/%25}"
+              missing=1
+            fi
+          done
+          if [[ $missing -ne 0 ]]; then exit 1; fi
+        else
+          for p in skills .claude/skills .agents/skills; do
+            if [[ -d "$p" ]]; then dirs+=("$p"); fi
+          done
+          if [[ ${#dirs[@]} -eq 0 ]]; then
+            echo "::error title=skills-doctor::No skills folder found (looked for skills, .claude/skills, .agents/skills). Set the path input."
+            exit 1
+          fi
+        fi
+        echo "Linting: ${dirs[*]} (fail-on: $fail_on)"
+
+        doctor="$GITHUB_ACTION_PATH/skills/skills-doctor/scripts/skills_doctor.py"
+        # argparse also exits 2 on a usage error, which must not read as "warnings only"
+        if ! "$SD_PYTHON" "$doctor" --help 2>/dev/null | grep -- '--format' >/dev/null; then
+          echo "::error title=skills-doctor::bundled skills_doctor.py is missing or too old for this action (no --format github)"
+          exit 1
+        fi
+
+        rc=0
+        "$SD_PYTHON" "$doctor" --format github --strict \
+          --overlap "$SD_OVERLAP" --trigger-overlap "$SD_TRIGGER_OVERLAP" -- "${dirs[@]}" || rc=$?
+        echo "exit-code=$rc" >> "$GITHUB_OUTPUT"
+        case "$rc" in
+          0) exit 0 ;;
+          1) if [[ "$fail_on" == never ]]; then exit 0; fi; exit 1 ;;
+          2) if [[ "$fail_on" == warning ]]; then exit 2; fi; exit 0 ;;
+          *) exit "$rc" ;;
+        esac
